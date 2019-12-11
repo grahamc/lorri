@@ -73,6 +73,25 @@ impl rpc::VarlinkInterface for Server {
             Err(e) => call.reply_invalid_parameter(e),
         }
     }
+
+    fn watch_services(
+        &self,
+        call: &mut dyn rpc::Call_WatchServices,
+        services_nix: rpc::ServicesNix,
+    ) -> varlink::Result<()> {
+        if !call.wants_more() {
+            return call.reply_invalid_parameter("called without more".to_string());
+        }
+        let (service_tx, service_rx) = chan::unbounded();
+        // TODO: start a new build loop, pass service_tx to it.
+
+        // This connection is meant to be closed by the client, not by the server.
+        call.set_continues(true);
+        for service in service_rx {
+            call.reply(service)?;
+        }
+        Ok(())
+    }
 }
 
 impl std::convert::TryFrom<NixFile> for rpc::ShellNix {

@@ -127,6 +127,21 @@ pub struct r#ShellNix {
     pub r#path: String,
 }
 #[derive(Serialize, Deserialize, Debug, PartialEq, Clone)]
+pub struct WatchServices_Reply {
+    pub r#service: Service,
+}
+impl varlink::VarlinkReply for WatchServices_Reply {}
+#[derive(Serialize, Deserialize, Debug, PartialEq, Clone)]
+pub struct WatchServices_Args {
+    pub r#services_nix: ServicesNix,
+}
+pub trait Call_WatchServices: VarlinkCallError {
+    fn reply(&mut self, r#service: Service) -> varlink::Result<()> {
+        self.reply_struct(WatchServices_Reply { r#service }.into())
+    }
+}
+impl<'a> Call_WatchServices for varlink::Call<'a> {}
+#[derive(Serialize, Deserialize, Debug, PartialEq, Clone)]
 pub struct WatchShell_Reply {}
 impl varlink::VarlinkReply for WatchShell_Reply {}
 #[derive(Serialize, Deserialize, Debug, PartialEq, Clone)]
@@ -140,6 +155,11 @@ pub trait Call_WatchShell: VarlinkCallError {
 }
 impl<'a> Call_WatchShell for varlink::Call<'a> {}
 pub trait VarlinkInterface {
+    fn watch_services(
+        &self,
+        call: &mut dyn Call_WatchServices,
+        r#services_nix: ServicesNix,
+    ) -> varlink::Result<()>;
     fn watch_shell(
         &self,
         call: &mut dyn Call_WatchShell,
@@ -154,6 +174,10 @@ pub trait VarlinkInterface {
     }
 }
 pub trait VarlinkClientInterface {
+    fn watch_services(
+        &mut self,
+        r#services_nix: ServicesNix,
+    ) -> varlink::MethodCall<WatchServices_Args, WatchServices_Reply, Error>;
     fn watch_shell(
         &mut self,
         r#shell_nix: ShellNix,
@@ -170,6 +194,16 @@ impl VarlinkClient {
     }
 }
 impl VarlinkClientInterface for VarlinkClient {
+    fn watch_services(
+        &mut self,
+        r#services_nix: ServicesNix,
+    ) -> varlink::MethodCall<WatchServices_Args, WatchServices_Reply, Error> {
+        varlink::MethodCall::<WatchServices_Args, WatchServices_Reply, Error>::new(
+            self.connection.clone(),
+            "com.target.lorri.WatchServices",
+            WatchServices_Args { r#services_nix },
+        )
+    }
     fn watch_shell(
         &mut self,
         r#shell_nix: ShellNix,
@@ -191,7 +225,7 @@ pub fn new(inner: Box<dyn VarlinkInterface + Send + Sync>) -> VarlinkInterfacePr
 }
 impl varlink::Interface for VarlinkInterfaceProxy {
     fn get_description(&self) -> &'static str {
-        "# The interface `lorri daemon` exposes.\ninterface com.target.lorri\n\n# WatchShell instructs the daemon to evaluate a Nix expression and re-evaluate\n# it when it or its dependencies change.\nmethod WatchShell(shell_nix: ShellNix) -> ()\n\n# ShellNix describes the Nix expression which evaluates to a development\n# environment.\ntype ShellNix (\n  # The absolute path of a Nix file specifying the project environment.\n  path: string\n)\n\n# WatchServices establishes a stream with the daemon. Initially, the daemon\n# evaluates the given services definition to an array of Command objects and\n# sends a reply for each of them. After this initial evaluation, the daemon\n# watches the services definition and its dependencies for changes,\n# re-evaluates it as appropriate and sends a reply for each Command again.\n#\n# This is a streaming RPC. The daemon only accepts client calls with the \"more\"\n# property set - see https://varlink.org/Method-Call.\n# TODO: Implement WatchServices\n#method WatchServices(services_nix: ServicesNix) -> (service: Service)\n\n# ServicesNix describes the Nix expression which evaluates to a list of\n# services.\ntype ServicesNix (\n  # The absolute path of a Nix file specifying the services to be run. This Nix\n  # file must evaluate to a JSON document of type []Command, that is, an array\n  # of objects whose properties are described by the Command type.\n  path: string\n)\n\n# Service describes an individual service to be run.\ntype Service (\n  # The user-friendly name of the service. This is used for identification\n  # purposes too: only a single instance of a service with a particular name is\n  # run at any one time.\n  name: string,\n\n  # How to run the service.\n  command: Command\n)\n\n# Command describes how to run a terminal application.\ntype Command (\n  # The path of the command binary.\n  program: string,\n\n  # Arguments to be passed to the binary.\n  args: []string\n)\n"
+        "# The interface `lorri daemon` exposes.\ninterface com.target.lorri\n\n# WatchShell instructs the daemon to evaluate a Nix expression and re-evaluate\n# it when it or its dependencies change.\nmethod WatchShell(shell_nix: ShellNix) -> ()\n\n# ShellNix describes the Nix expression which evaluates to a development\n# environment.\ntype ShellNix (\n  # The absolute path of a Nix file specifying the project environment.\n  path: string\n)\n\n# WatchServices establishes a stream with the daemon. Initially, the daemon\n# evaluates the given services definition to an array of Command objects and\n# sends a reply for each of them. After this initial evaluation, the daemon\n# watches the services definition and its dependencies for changes,\n# re-evaluates it as appropriate and sends a reply for each Command again.\n#\n# This is a streaming RPC. The daemon only accepts client calls with the \"more\"\n# property set - see https://varlink.org/Method-Call.\nmethod WatchServices(services_nix: ServicesNix) -> (service: Service)\n\n# ServicesNix describes the Nix expression which evaluates to a list of\n# services.\ntype ServicesNix (\n  # The absolute path of a Nix file specifying the services to be run. This Nix\n  # file must evaluate to a JSON document of type []Command, that is, an array\n  # of objects whose properties are described by the Command type.\n  path: string\n)\n\n# Service describes an individual service to be run.\ntype Service (\n  # The user-friendly name of the service. This is used for identification\n  # purposes too: only a single instance of a service with a particular name is\n  # run at any one time.\n  name: string,\n\n  # How to run the service.\n  command: Command\n)\n\n# Command describes how to run a terminal application.\ntype Command (\n  # The path of the command binary.\n  program: string,\n\n  # Arguments to be passed to the binary.\n  args: []string\n)\n"
     }
     fn get_name(&self) -> &'static str {
         "com.target.lorri"
@@ -206,6 +240,24 @@ impl varlink::Interface for VarlinkInterfaceProxy {
     fn call(&self, call: &mut varlink::Call) -> varlink::Result<()> {
         let req = call.request.unwrap();
         match req.method.as_ref() {
+            "com.target.lorri.WatchServices" => {
+                if let Some(args) = req.parameters.clone() {
+                    let args: WatchServices_Args = match serde_json::from_value(args) {
+                        Ok(v) => v,
+                        Err(e) => {
+                            let es = format!("{}", e);
+                            let _ = call.reply_invalid_parameter(es.clone());
+                            return Err(
+                                varlink::context!(varlink::ErrorKind::SerdeJsonDe(es)).into()
+                            );
+                        }
+                    };
+                    self.inner
+                        .watch_services(call as &mut dyn Call_WatchServices, args.r#services_nix)
+                } else {
+                    call.reply_invalid_parameter("parameters".into())
+                }
+            }
             "com.target.lorri.WatchShell" => {
                 if let Some(args) = req.parameters.clone() {
                     let args: WatchShell_Args = match serde_json::from_value(args) {

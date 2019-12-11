@@ -20,8 +20,7 @@ type ShellNix (
 #
 # This is a streaming RPC. The daemon only accepts client calls with the "more"
 # property set - see https://varlink.org/Method-Call.
-# TODO: Implement WatchServices
-#method WatchServices(services_nix: ServicesNix) -> (service: Service)
+method WatchServices(services_nix: ServicesNix) -> (service: Service)
 
 # ServicesNix describes the Nix expression which evaluates to a list of
 # services.
