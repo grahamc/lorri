@@ -109,7 +109,7 @@ fn run_command(log: slog::Logger, opts: Arguments) -> OpResult {
         }
         Command::Services(opts) => {
             let _guard = without_project();
-            services::main(&opts.config_file)
+            services::main(opts.config_file.to_path_buf())
         }
         // TODO: remove
         Command::Ping_(opts) => {
