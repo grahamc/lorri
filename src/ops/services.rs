@@ -8,7 +8,8 @@ use crossbeam_channel as chan;
 use futures::channel::oneshot;
 use futures::future::{self, Either};
 use futures::prelude::*;
-use slog_scope::{error, info, warn};
+use slog_scope::{debug, error, info, warn};
+use std::collections::HashMap;
 use std::fmt::Debug;
 use std::fs::File;
 use std::path::PathBuf;
@@ -37,7 +38,7 @@ struct Services {
     services: Vec<Service>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Hash)]
 struct Service {
     name: String,
     program: PathBuf,
@@ -104,51 +105,75 @@ pub fn main(services_nix: PathBuf) -> OpResult {
     ok()
 }
 
-async fn main_async(mut file_rx: Receiver<(crate::nix::StorePath, crate::nix::GcRootTempDir)>) {
-    let mut built_service = file_rx.recv().await.unwrap();
-
-    loop {
-        // TODO: do something with the GC root dir?
-        let (store_path, _gc_root_dir) = built_service;
-        let services = {
+async fn main_async(file_rx: Receiver<(crate::nix::StorePath, crate::nix::GcRootTempDir)>) {
+    file_rx
+        .filter_map::<_, (Services, crate::nix::GcRootTempDir), _>(|(store_path, gc_root)| async move {
+            // Convert a given message in to Services
             let store_path = store_path.as_path();
-            let f = match File::open(store_path) {
+
+            let handle = match File::open(store_path) {
                 Ok(f) => f,
                 Err(e) => {
                     error!("failed to open services definition '{}' for reading", store_path.display(); "error" => ?e);
-                    built_service = file_rx.recv().await.unwrap();
-                    continue;
+                    return None;
                 }
             };
-            match serde_json::from_reader(std::io::BufReader::new(f)) {
-                Ok(Services { services }) => services,
+
+            match serde_json::from_reader(std::io::BufReader::new(handle)) {
+                Ok(services) => Some((services, gc_root)),
                 Err(e) => {
                     error!("failed to parse '{}' as a list of services", store_path.display(); "error" => ?e);
-                    built_service = file_rx.recv().await.unwrap();
-                    continue;
+                    return None;
                 }
             }
-        };
+        })
+        .fold::<ProcessGroup, _, _>(ProcessGroup::empty(), |mut previous_process_group, (mut services, _gc_root)| async move {
+            enum ServiceProc {
+                AlreadyRunning(ProcessGroupMember),
+                ToStart(Service)
+            }
 
-        let mut to_kill = vec![];
-        for service in services {
-            let (stop, stopped) = oneshot::channel::<()>();
-            to_kill.push(stop);
-            tokio::spawn(start_service(service, stopped));
-        }
+            let procs: Vec<_> = services.services
+                .drain(..)
+                .map(|service| {
+                    match previous_process_group.take(&service) {
+                        Some(proc) => {
+                            info!("Adopting {:?} from prior group", &service);
+                            ServiceProc::AlreadyRunning(proc)
+                        },
+                        None => {
+                            info!("Spawning a new {:?}", &service);
+                            ServiceProc::ToStart(service)
+                        }
+                    }
+                })
+                .collect();
 
-        built_service = file_rx.recv().await.unwrap();
+            drop(previous_process_group);
 
-        for stop in to_kill.into_iter() {
-            stop.send(()).unwrap();
-        }
-    }
+            let mut new_group = ProcessGroup::empty();
+
+            for proc in procs {
+                match proc {
+                    ServiceProc::AlreadyRunning(proc) => new_group.adopt(proc),
+                    ServiceProc::ToStart(service) => {
+                        let (stop, stopped) = oneshot::channel::<()>();
+
+                        new_group.insert(service.clone(), stop);
+                        tokio::spawn(start_service(service, stopped));
+                    }
+                }
+            }
+
+            new_group
+        })
+        .await;
 }
 
 async fn start_service(service: Service, stop: oneshot::Receiver<()>) {
     info!("starting"; "name" => &service.name);
     let mut child = Command::new(&service.program)
-        .args(service.args)
+        .args(&service.args)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -202,3 +227,44 @@ async fn cleanup(mut child: Child, name: String, cancel: oneshot::Receiver<()>) 
         }
     };
 }
+
+#[derive(Default, Debug)]
+struct ProcessGroup {
+    processes: HashMap<Service, oneshot::Sender<()>>,
+}
+
+impl ProcessGroup {
+    fn empty() -> Self {
+        ProcessGroup {
+            processes: HashMap::new(),
+        }
+    }
+
+    fn insert(&mut self, service: Service, kill: oneshot::Sender<()>) {
+        self.processes.insert(service, kill);
+    }
+
+    fn take(&mut self, service: &Service) -> Option<ProcessGroupMember> {
+        let (service, stop) = self.processes.remove_entry(&service)?;
+        Some(ProcessGroupMember(service, stop))
+    }
+
+    fn adopt(&mut self, member: ProcessGroupMember) {
+        self.processes.insert(member.0, member.1);
+    }
+}
+
+impl Drop for ProcessGroup {
+    fn drop(&mut self) {
+        self.processes.drain().for_each(|(service, stop)| {
+            if let Err(_) = stop.send(()) {
+                debug!(
+                    "Failed to send stop message to service: {:#?} (it probably died.)",
+                    &service
+                );
+            }
+        });
+    }
+}
+
+struct ProcessGroupMember(Service, oneshot::Sender<()>);
